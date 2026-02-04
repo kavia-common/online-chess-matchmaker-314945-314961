@@ -272,10 +272,15 @@ async def enqueue_matchmaking(payload: MatchmakingEnqueueRequest, db: AsyncSessi
         raise HTTPException(status_code=500, detail="Ticket creation failed")
 
     tm = _as_mapping(ticket)
+
+    # Defensive: tests require `status` to always be present in the response JSON.
+    # If the DB row is missing `status` for any reason, infer it from whether a game is assigned.
+    status = tm.get("status") or ("matched" if tm.get("game_id") else "queued")
+
     return MatchmakingTicketResponse(
         ticket_id=str(tm["id"]),
-        status=tm["status"],
-        game_id=str(tm["game_id"]) if tm["game_id"] else None,
+        status=status,
+        game_id=str(tm["game_id"]) if tm.get("game_id") else None,
         created_at=tm["created_at"],
         updated_at=tm["updated_at"],
     )
@@ -490,5 +495,7 @@ async def player_history(
         ),
         {"pid": player_id, "lim": limit},
     )
-    games = [_row_to_game(r) for r in games_res.mappings().all()]
+
+    rows = games_res.mappings().all()
+    games = [_row_to_game(r) for r in rows] if rows else []
     return HistoryResponse(games=games)
