@@ -1,4 +1,3 @@
-import uuid
 from datetime import datetime
 
 import pytest
@@ -6,9 +5,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from src.api.chess_rules import STARTING_FEN
 from src.api.db import get_db_session
 from src.api.main import app
-from src.api.chess_rules import STARTING_FEN
 
 # Minimal schema required by src.api.main SQL statements.
 _SQLITE_SCHEMA = [
@@ -73,13 +72,23 @@ _SQLITE_SCHEMA = [
 @pytest.fixture()
 def api_client():
     """
-    Provide a FastAPI TestClient backed by an in-memory SQLite async DB.
+    Provide a FastAPI TestClient backed by a SQLite async DB, without relying on
+    private TestClient internals like `TestClient._loop`.
 
-    Note: this fixture is synchronous (no pytest-asyncio dependency). We create the
-    schema using TestClient's event loop runner, and override the get_db_session
-    dependency to yield sessions from the same engine.
+    Implementation details:
+    - Uses a *shared* in-memory SQLite database so multiple async connections see the same schema.
+    - Initializes schema via an AsyncEngine connection (no pytest-asyncio needed; we run it via `asyncio.run`).
+    - Overrides `get_db_session` so the FastAPI app uses the test engine.
     """
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    import asyncio
+
+    # Shared in-memory DB across connections:
+    # https://www.sqlite.org/inmemorydb.html#sharedmemdb
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///file::memory:?cache=shared",
+        future=True,
+        connect_args={"uri": True},
+    )
     sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
 
     async def init_schema():
@@ -91,36 +100,19 @@ def api_client():
         async with sessionmaker() as session:
             yield session
 
+    # Initialize schema once before using the client.
+    asyncio.run(init_schema())
+
     # Install dependency override before creating TestClient.
     app.dependency_overrides[get_db_session] = override_get_db_session
 
     with TestClient(app) as client:
-        client.app.state._test_engine = engine  # for debugging if needed
-        client.app.state._test_sessionmaker = sessionmaker
-        client.app.state._test_init_schema = init_schema
-
-        # Create schema
-        client.app.dependency_overrides = app.dependency_overrides
-        client.__enter__()
         try:
-            client._loop.run_until_complete(init_schema())
+            yield client
         finally:
-            client.__exit__(None, None, None)
-
-    # The above pattern can't be reused; instead we open a fresh TestClient below.
-    # Create a new TestClient and re-attach overrides and schema for actual use.
-    app.dependency_overrides[get_db_session] = override_get_db_session
-    client = TestClient(app)
-    client.__enter__()
-    client._loop.run_until_complete(init_schema())
-
-    try:
-        yield client
-    finally:
-        client.__exit__(None, None, None)
-        # Cleanup overrides to avoid cross-test leakage.
-        app.dependency_overrides.clear()
-        client._loop.run_until_complete(engine.dispose())
+            # Cleanup overrides to avoid cross-test leakage.
+            app.dependency_overrides.clear()
+            asyncio.run(engine.dispose())
 
 
 async def _insert_player(db: AsyncSession, player_id: str, nickname: str):
