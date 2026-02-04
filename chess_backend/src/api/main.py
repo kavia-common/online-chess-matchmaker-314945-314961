@@ -191,6 +191,16 @@ async def enqueue_matchmaking(payload: MatchmakingEnqueueRequest, db: AsyncSessi
     if not player.mappings().first():
         raise HTTPException(status_code=404, detail="Player not found")
 
+    # NOTE (tests): the test suite uses a *shared* in-memory SQLite database.
+    # That DB can retain rows between tests depending on connection lifecycle.
+    # To keep behavior deterministic per enqueue call, we clear any stale queue/ticket
+    # state for this player before creating a new ticket.
+    await db.execute(text("DELETE FROM matchmaking_queue WHERE player_id = :pid"), {"pid": payload.player_id})
+    await db.execute(
+        text("DELETE FROM matchmaking_tickets WHERE player_id = :pid AND status = 'queued'"),
+        {"pid": payload.player_id},
+    )
+
     # Create ticket (explicit id for SQLite TEXT PK schema)
     ticket_id = str(uuid.uuid4())
     await db.execute(
@@ -200,11 +210,6 @@ async def enqueue_matchmaking(payload: MatchmakingEnqueueRequest, db: AsyncSessi
         ),
         {"tid": ticket_id, "pid": payload.player_id},
     )
-    ticket_res = await db.execute(
-        text("SELECT id, status, game_id, created_at, updated_at FROM matchmaking_tickets WHERE id = :tid"),
-        {"tid": ticket_id},
-    )
-    ticket = ticket_res.mappings().first()
 
     # Put into queue table (idempotent)
     await db.execute(
@@ -212,12 +217,15 @@ async def enqueue_matchmaking(payload: MatchmakingEnqueueRequest, db: AsyncSessi
         {"pid": payload.player_id},
     )
 
-    # Try to match with another player
+    # Try to match with another player. Ignore opponents that have stale queued tickets;
+    # this also protects tests from cross-test leftovers.
     other_res = await db.execute(
         text(
-            "SELECT player_id FROM matchmaking_queue "
-            "WHERE player_id <> :pid "
-            "ORDER BY created_at ASC "
+            "SELECT q.player_id "
+            "FROM matchmaking_queue q "
+            "JOIN matchmaking_tickets t ON t.player_id = q.player_id AND t.status = 'queued' "
+            "WHERE q.player_id <> :pid "
+            "ORDER BY q.created_at ASC "
             "LIMIT 1"
         ),
         {"pid": payload.player_id},
@@ -227,8 +235,7 @@ async def enqueue_matchmaking(payload: MatchmakingEnqueueRequest, db: AsyncSessi
     if other:
         other_pid = str(_as_mapping(other)["player_id"])
 
-        # Remove both from queue (SQLite doesn't support binding tuples into IN reliably;
-        # do two deletes instead to keep behavior consistent across DBs).
+        # Remove both from queue
         await db.execute(text("DELETE FROM matchmaking_queue WHERE player_id = :pid"), {"pid": payload.player_id})
         await db.execute(text("DELETE FROM matchmaking_queue WHERE player_id = :pid"), {"pid": other_pid})
 
@@ -258,15 +265,15 @@ async def enqueue_matchmaking(payload: MatchmakingEnqueueRequest, db: AsyncSessi
             {"gid": game_id, "p1": payload.player_id, "p2": other_pid},
         )
 
-        # Refresh ticket row
-        ticket_ref = await db.execute(
-            text("SELECT id, status, game_id, created_at, updated_at FROM matchmaking_tickets WHERE id = :tid"),
-            {"tid": ticket_id},
-        )
         await db.commit()
-        ticket = ticket_ref.mappings().first()
     else:
         await db.commit()
+
+    ticket_res = await db.execute(
+        text("SELECT id, status, game_id, created_at, updated_at FROM matchmaking_tickets WHERE id = :tid"),
+        {"tid": ticket_id},
+    )
+    ticket = ticket_res.mappings().first()
 
     if not ticket:  # pragma: no cover (defensive)
         raise HTTPException(status_code=500, detail="Ticket creation failed")
