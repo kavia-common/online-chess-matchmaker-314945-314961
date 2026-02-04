@@ -14,10 +14,10 @@ This backend is designed to be consumed by the React frontend via REST.
 from __future__ import annotations
 
 import os
+import uuid
 from datetime import datetime
-from typing import List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -131,11 +131,19 @@ async def create_player(payload: PlayerCreateRequest, db: AsyncSession = Depends
     if row:
         return _row_to_player(row)
 
-    created = await db.execute(
-        text("INSERT INTO players (nickname) VALUES (:n) RETURNING id, nickname, created_at"),
-        {"n": nickname},
+    # SQLite test schema defines `id TEXT PRIMARY KEY` with no default, so we must
+    # generate IDs in application code (also works fine for Postgres).
+    player_id = str(uuid.uuid4())
+    await db.execute(
+        text("INSERT INTO players (id, nickname) VALUES (:id, :n)"),
+        {"id": player_id, "n": nickname},
     )
     await db.commit()
+
+    created = await db.execute(
+        text("SELECT id, nickname, created_at FROM players WHERE id = :id"),
+        {"id": player_id},
+    )
     return _row_to_player(created.mappings().first())
 
 
@@ -157,14 +165,18 @@ async def enqueue_matchmaking(payload: MatchmakingEnqueueRequest, db: AsyncSessi
     if not player.first():
         raise HTTPException(status_code=404, detail="Player not found")
 
-    # Create ticket
-    ticket_res = await db.execute(
+    # Create ticket (explicit id for SQLite TEXT PK schema)
+    ticket_id = str(uuid.uuid4())
+    await db.execute(
         text(
-            "INSERT INTO matchmaking_tickets (player_id, status) "
-            "VALUES (:pid, 'queued') "
-            "RETURNING id, status, game_id, created_at, updated_at"
+            "INSERT INTO matchmaking_tickets (id, player_id, status) "
+            "VALUES (:tid, :pid, 'queued')"
         ),
-        {"pid": payload.player_id},
+        {"tid": ticket_id, "pid": payload.player_id},
+    )
+    ticket_res = await db.execute(
+        text("SELECT id, status, game_id, created_at, updated_at FROM matchmaking_tickets WHERE id = :tid"),
+        {"tid": ticket_id},
     )
     ticket = ticket_res.mappings().first()
 
@@ -195,15 +207,14 @@ async def enqueue_matchmaking(payload: MatchmakingEnqueueRequest, db: AsyncSessi
         p2 = str(other.player_id)
         white_id, black_id = (p1, p2) if p1 < p2 else (p2, p1)
 
-        game_res = await db.execute(
+        game_id = str(uuid.uuid4())
+        await db.execute(
             text(
-                "INSERT INTO games (white_player_id, black_player_id, status, winner_color, initial_fen, current_fen, pgn) "
-                "VALUES (:w, :b, 'active', NULL, :fen, :fen, '') "
-                "RETURNING id"
+                "INSERT INTO games (id, white_player_id, black_player_id, status, winner_color, initial_fen, current_fen, pgn) "
+                "VALUES (:gid, :w, :b, 'active', NULL, :fen, :fen, '')"
             ),
-            {"w": white_id, "b": black_id, "fen": STARTING_FEN},
+            {"gid": game_id, "w": white_id, "b": black_id, "fen": STARTING_FEN},
         )
-        game_id = str(game_res.mappings().first().id)
 
         # Mark both players' queued tickets as matched (best effort: latest queued ticket)
         await db.execute(
@@ -220,7 +231,7 @@ async def enqueue_matchmaking(payload: MatchmakingEnqueueRequest, db: AsyncSessi
         # Refresh ticket row
         ticket_ref = await db.execute(
             text("SELECT id, status, game_id, created_at, updated_at FROM matchmaking_tickets WHERE id = :tid"),
-            {"tid": str(ticket.id)},
+            {"tid": ticket_id},
         )
         await db.commit()
         ticket = ticket_ref.mappings().first()
