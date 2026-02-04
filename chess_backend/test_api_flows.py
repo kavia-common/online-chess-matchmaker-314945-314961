@@ -13,7 +13,7 @@ from src.api.main import app
 _SQLITE_SCHEMA = [
     # players
     """
-    CREATE TABLE players (
+    CREATE TABLE IF NOT EXISTS players (
         id TEXT PRIMARY KEY,
         nickname TEXT UNIQUE NOT NULL,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -21,14 +21,14 @@ _SQLITE_SCHEMA = [
     """,
     # matchmaking queue
     """
-    CREATE TABLE matchmaking_queue (
+    CREATE TABLE IF NOT EXISTS matchmaking_queue (
         player_id TEXT PRIMARY KEY,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
     """,
     # matchmaking tickets
     """
-    CREATE TABLE matchmaking_tickets (
+    CREATE TABLE IF NOT EXISTS matchmaking_tickets (
         id TEXT PRIMARY KEY,
         player_id TEXT NOT NULL,
         status TEXT NOT NULL,
@@ -39,7 +39,7 @@ _SQLITE_SCHEMA = [
     """,
     # games
     """
-    CREATE TABLE games (
+    CREATE TABLE IF NOT EXISTS games (
         id TEXT PRIMARY KEY,
         white_player_id TEXT NOT NULL,
         black_player_id TEXT NOT NULL,
@@ -55,7 +55,7 @@ _SQLITE_SCHEMA = [
     """,
     # moves
     """
-    CREATE TABLE moves (
+    CREATE TABLE IF NOT EXISTS moves (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         game_id TEXT NOT NULL,
         move_number INTEGER NOT NULL,
