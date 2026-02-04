@@ -70,24 +70,19 @@ _SQLITE_SCHEMA = [
 
 
 @pytest.fixture()
-def api_client():
+def api_client(tmp_path):
     """
-    Provide a FastAPI TestClient backed by a SQLite async DB, without relying on
-    private TestClient internals like `TestClient._loop`.
+    Provide a FastAPI TestClient backed by an isolated SQLite async DB.
 
-    Implementation details:
-    - Uses a *shared* in-memory SQLite database so multiple async connections see the same schema.
-    - Initializes schema via an AsyncEngine connection (no pytest-asyncio needed; we run it via `asyncio.run`).
-    - Overrides `get_db_session` so the FastAPI app uses the test engine.
+    IMPORTANT: We use a unique SQLite *file* per test instead of a shared-cache
+    in-memory DB (e.g. file::memory:?cache=shared) to avoid cross-test leakage.
     """
     import asyncio
 
-    # Shared in-memory DB across connections:
-    # https://www.sqlite.org/inmemorydb.html#sharedmemdb
+    db_path = tmp_path / "test.sqlite3"
     engine = create_async_engine(
-        "sqlite+aiosqlite:///file::memory:?cache=shared",
+        f"sqlite+aiosqlite:///{db_path}",
         future=True,
-        connect_args={"uri": True},
     )
     sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -100,17 +95,13 @@ def api_client():
         async with sessionmaker() as session:
             yield session
 
-    # Initialize schema once before using the client.
     asyncio.run(init_schema())
-
-    # Install dependency override before creating TestClient.
     app.dependency_overrides[get_db_session] = override_get_db_session
 
     with TestClient(app) as client:
         try:
             yield client
         finally:
-            # Cleanup overrides to avoid cross-test leakage.
             app.dependency_overrides.clear()
             asyncio.run(engine.dispose())
 
