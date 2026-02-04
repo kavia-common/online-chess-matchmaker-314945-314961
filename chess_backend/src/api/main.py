@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import datetime
+from typing import Any, Mapping
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -63,21 +64,43 @@ app.add_middleware(
 )
 
 
-def _row_to_player(row) -> PlayerResponse:
-    return PlayerResponse(id=str(row.id), nickname=row.nickname, created_at=row.created_at)
+def _as_mapping(row: Any) -> Mapping[str, Any]:
+    """
+    Convert a SQLAlchemy row into a mapping-like interface.
+
+    We fetch rows using `Result.mappings()` in most endpoints, which yields
+    `RowMapping` objects. Those must be accessed by key (`row["id"]`) rather than
+    attribute (`row.id`). This helper keeps the conversion logic centralized.
+    """
+    # RowMapping already behaves like a Mapping; keep as-is.
+    if isinstance(row, Mapping):
+        return row
+    # Fallback: attempt to use SQLAlchemy Row._mapping if present.
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        return mapping
+    raise TypeError("Unsupported row type; expected a mapping/RowMapping.")
 
 
-def _row_to_game(row) -> GameResponse:
+def _row_to_player(row: Any) -> PlayerResponse:
+    """Convert a DB row mapping into a PlayerResponse."""
+    m = _as_mapping(row)
+    return PlayerResponse(id=str(m["id"]), nickname=m["nickname"], created_at=m["created_at"])
+
+
+def _row_to_game(row: Any) -> GameResponse:
+    """Convert a DB row mapping into a GameResponse."""
+    m = _as_mapping(row)
     return GameResponse(
-        id=str(row.id),
-        white_player_id=str(row.white_player_id),
-        black_player_id=str(row.black_player_id),
-        status=row.status,
-        winner_color=row.winner_color,
-        current_fen=row.current_fen,
-        created_at=row.created_at,
-        updated_at=row.updated_at,
-        ended_at=row.ended_at,
+        id=str(m["id"]),
+        white_player_id=str(m["white_player_id"]),
+        black_player_id=str(m["black_player_id"]),
+        status=m["status"],
+        winner_color=m["winner_color"],
+        current_fen=m["current_fen"],
+        created_at=m["created_at"],
+        updated_at=m["updated_at"],
+        ended_at=m["ended_at"],
     )
 
 
@@ -144,7 +167,10 @@ async def create_player(payload: PlayerCreateRequest, db: AsyncSession = Depends
         text("SELECT id, nickname, created_at FROM players WHERE id = :id"),
         {"id": player_id},
     )
-    return _row_to_player(created.mappings().first())
+    created_row = created.mappings().first()
+    if not created_row:  # pragma: no cover (defensive)
+        raise HTTPException(status_code=500, detail="Player creation failed")
+    return _row_to_player(created_row)
 
 
 @app.post(
@@ -160,9 +186,9 @@ async def enqueue_matchmaking(payload: MatchmakingEnqueueRequest, db: AsyncSessi
 
     Returns a ticket id. Client should poll /matchmaking/tickets/{ticket_id}.
     """
-    # Verify player exists
+    # Verify player exists (use mappings for consistent access patterns)
     player = await db.execute(text("SELECT id FROM players WHERE id = :pid"), {"pid": payload.player_id})
-    if not player.first():
+    if not player.mappings().first():
         raise HTTPException(status_code=404, detail="Player not found")
 
     # Create ticket (explicit id for SQLite TEXT PK schema)
@@ -199,12 +225,16 @@ async def enqueue_matchmaking(payload: MatchmakingEnqueueRequest, db: AsyncSessi
     other = other_res.mappings().first()
 
     if other:
-        # Remove both from queue
-        await db.execute(text("DELETE FROM matchmaking_queue WHERE player_id IN (:p1, :p2)"), {"p1": payload.player_id, "p2": other.player_id})
+        other_pid = str(_as_mapping(other)["player_id"])
+
+        # Remove both from queue (SQLite doesn't support binding tuples into IN reliably;
+        # do two deletes instead to keep behavior consistent across DBs).
+        await db.execute(text("DELETE FROM matchmaking_queue WHERE player_id = :pid"), {"pid": payload.player_id})
+        await db.execute(text("DELETE FROM matchmaking_queue WHERE player_id = :pid"), {"pid": other_pid})
 
         # Assign colors by deterministic ordering (avoid bias by time alone)
         p1 = payload.player_id
-        p2 = str(other.player_id)
+        p2 = other_pid
         white_id, black_id = (p1, p2) if p1 < p2 else (p2, p1)
 
         game_id = str(uuid.uuid4())
@@ -225,7 +255,7 @@ async def enqueue_matchmaking(payload: MatchmakingEnqueueRequest, db: AsyncSessi
                 "  ORDER BY created_at DESC LIMIT 2"
                 ")"
             ),
-            {"gid": game_id, "p1": payload.player_id, "p2": other.player_id},
+            {"gid": game_id, "p1": payload.player_id, "p2": other_pid},
         )
 
         # Refresh ticket row
@@ -235,16 +265,19 @@ async def enqueue_matchmaking(payload: MatchmakingEnqueueRequest, db: AsyncSessi
         )
         await db.commit()
         ticket = ticket_ref.mappings().first()
-
     else:
         await db.commit()
 
+    if not ticket:  # pragma: no cover (defensive)
+        raise HTTPException(status_code=500, detail="Ticket creation failed")
+
+    tm = _as_mapping(ticket)
     return MatchmakingTicketResponse(
-        ticket_id=str(ticket.id),
-        status=ticket.status,
-        game_id=str(ticket.game_id) if ticket.game_id else None,
-        created_at=ticket.created_at,
-        updated_at=ticket.updated_at,
+        ticket_id=str(tm["id"]),
+        status=tm["status"],
+        game_id=str(tm["game_id"]) if tm["game_id"] else None,
+        created_at=tm["created_at"],
+        updated_at=tm["updated_at"],
     )
 
 
@@ -267,12 +300,13 @@ async def get_ticket(ticket_id: str, db: AsyncSession = Depends(get_db_session))
     if not row:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
+    m = _as_mapping(row)
     return MatchmakingTicketResponse(
-        ticket_id=str(row.id),
-        status=row.status,
-        game_id=str(row.game_id) if row.game_id else None,
-        created_at=row.created_at,
-        updated_at=row.updated_at,
+        ticket_id=str(m["id"]),
+        status=m["status"],
+        game_id=str(m["game_id"]) if m["game_id"] else None,
+        created_at=m["created_at"],
+        updated_at=m["updated_at"],
     )
 
 
@@ -311,21 +345,25 @@ async def get_game_with_moves(game_id: str, db: AsyncSession = Depends(get_db_se
         raise HTTPException(status_code=404, detail="Game not found")
 
     moves_res = await db.execute(
-        text("SELECT id, game_id, move_number, color, uci, san, fen_after, created_at FROM moves WHERE game_id = :gid ORDER BY created_at ASC"),
+        text(
+            "SELECT id, game_id, move_number, color, uci, san, fen_after, created_at "
+            "FROM moves WHERE game_id = :gid ORDER BY created_at ASC"
+        ),
         {"gid": game_id},
     )
     moves = []
     for m in moves_res.mappings().all():
+        mm = _as_mapping(m)
         moves.append(
             MoveResponse(
-                id=m.id,
-                game_id=str(m.game_id),
-                move_number=m.move_number,
-                color=m.color,
-                uci=m.uci,
-                san=m.san,
-                fen_after=m.fen_after,
-                created_at=m.created_at,
+                id=mm["id"],
+                game_id=str(mm["game_id"]),
+                move_number=mm["move_number"],
+                color=mm["color"],
+                uci=mm["uci"],
+                san=mm["san"],
+                fen_after=mm["fen_after"],
+                created_at=mm["created_at"],
             )
         )
 
@@ -356,27 +394,29 @@ async def submit_move(game_id: str, payload: MoveCreateRequest, db: AsyncSession
     game = game_res.mappings().first()
     if not game:
         raise HTTPException(status_code=404, detail="Game not found")
-    if game.status != "active":
+
+    gm = _as_mapping(game)
+    if gm["status"] != "active":
         raise HTTPException(status_code=409, detail="Game is not active")
 
     pid = payload.player_id
-    if str(game.white_player_id) != pid and str(game.black_player_id) != pid:
+    if str(gm["white_player_id"]) != pid and str(gm["black_player_id"]) != pid:
         raise HTTPException(status_code=403, detail="Player not in this game")
 
-    expected_color = side_to_move(game.current_fen)
-    player_color = "white" if str(game.white_player_id) == pid else "black"
+    expected_color = side_to_move(gm["current_fen"])
+    player_color = "white" if str(gm["white_player_id"]) == pid else "black"
     if expected_color != player_color:
         raise HTTPException(status_code=409, detail=f"It is {expected_color}'s turn")
 
     # Apply move
     try:
-        applied = apply_uci_move(game.current_fen, payload.uci)
+        applied = apply_uci_move(gm["current_fen"], payload.uci)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Determine next move number: count moves for this game
     count_res = await db.execute(text("SELECT COUNT(*) AS c FROM moves WHERE game_id = :gid"), {"gid": game_id})
-    count = int(count_res.mappings().first().c)
+    count = int(_as_mapping(count_res.mappings().first())["c"])
     move_number = (count // 2) + 1
 
     # Insert move
@@ -389,6 +429,9 @@ async def submit_move(game_id: str, payload: MoveCreateRequest, db: AsyncSession
         {"gid": game_id, "mn": move_number, "color": player_color, "uci": applied.uci, "san": applied.san, "fen": applied.fen_after},
     )
     move_row = move_row_res.mappings().first()
+    if not move_row:  # pragma: no cover (defensive)
+        raise HTTPException(status_code=500, detail="Move insert failed")
+    mm = _as_mapping(move_row)
 
     # Update game
     winner = winner_if_game_over(applied.fen_after)
@@ -407,14 +450,14 @@ async def submit_move(game_id: str, payload: MoveCreateRequest, db: AsyncSession
     await db.commit()
 
     return MoveResponse(
-        id=move_row.id,
-        game_id=str(move_row.game_id),
-        move_number=move_row.move_number,
-        color=move_row.color,
-        uci=move_row.uci,
-        san=move_row.san,
-        fen_after=move_row.fen_after,
-        created_at=move_row.created_at,
+        id=mm["id"],
+        game_id=str(mm["game_id"]),
+        move_number=mm["move_number"],
+        color=mm["color"],
+        uci=mm["uci"],
+        san=mm["san"],
+        fen_after=mm["fen_after"],
+        created_at=mm["created_at"],
     )
 
 
@@ -433,9 +476,9 @@ async def player_history(
     PUBLIC_INTERFACE
     Return recent games involving the specified player.
     """
-    # Verify player exists
+    # Verify player exists (use mappings so SQLite returns are read correctly)
     player = await db.execute(text("SELECT id FROM players WHERE id = :pid"), {"pid": player_id})
-    if not player.first():
+    if not player.mappings().first():
         raise HTTPException(status_code=404, detail="Player not found")
 
     games_res = await db.execute(
